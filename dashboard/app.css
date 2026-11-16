@@ -65,6 +65,8 @@ td.wrap { white-space:normal; min-width:240px; }
 .neg { color:var(--bad); }
 .badge { display:inline-flex; align-items:center; padding:3px 8px; border-radius:999px; font-size:11px; border:1px solid var(--border); background:#f7faf8; color:var(--muted); }
 .badge.live { color:var(--warn); background:#fff7ed; border-color:#fed7aa; }
+.badge.watch { color:#0f5132; background:#ecfdf3; border-color:#abefc6; }
+.badge.early { color:#1e40af; background:#eff6ff; border-color:#bfdbfe; }
 .barcell { min-width:170px; }
 .bar { height:7px; background:#e7ece9; border-radius:999px; overflow:hidden; margin-top:5px; }
 .bar i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),#22c55e); }

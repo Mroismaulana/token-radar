@@ -125,6 +125,7 @@ export interface RadarRow {
   maturity_multiplier: number;
   chain_multiplier: number;
   category_multiplier: number;
+  on_watchlist: boolean;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -146,6 +147,7 @@ export interface RadarData {
   model: ModelConstants;
   model_version: string;
   watchlist_size: number;
+  watchlist: string[];
   board_size: number;
   early_size: number;
   live_size: number;
@@ -406,7 +408,7 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 }
 
 /** A board row's compact form for data.js, with the farm plan generated in the page. */
-export function radarRow(row: BoardRow): RadarRow {
+export function radarRow(row: BoardRow, watchlist: string[]): RadarRow {
   return {
     rank: row.rank,
     slug: row.slug,
@@ -423,6 +425,7 @@ export function radarRow(row: BoardRow): RadarRow {
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
     category_multiplier: row.model.category_multiplier,
+    on_watchlist: watchlist.includes(row.slug),
   };
 }
 
@@ -438,10 +441,11 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     model,
     model_version: MODEL_VERSION,
     watchlist_size: snapshot.watchlist.length,
+    watchlist: snapshot.watchlist,
     board_size: board.length,
     early_size: early,
     live_size: live.length,
-    rows: board.map(radarRow),
+    rows: board.map((row) => radarRow(row, snapshot.watchlist)),
     live,
   };
   return { board, radar };

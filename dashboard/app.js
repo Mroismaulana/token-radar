@@ -207,7 +207,8 @@
       el('section', { class: 'sec' },
         el('h3', { text: 'Protocol facts (from snapshot)' }),
         el('div', { class: 'kv' },
-          kv('Slug', r.slug), kv('Market cap recorded', r.mcap_usd == null ? 'none (pre-token)' : fmtUsd(r.mcap_usd)),
+          kv('Slug', r.slug), kv('Watchlist', r.on_watchlist ? 'yes (must-cover)' : 'no (early find below floor)'),
+          kv('Market cap recorded', r.mcap_usd == null ? 'none (pre-token)' : fmtUsd(r.mcap_usd)),
           kv('Token symbol/id', (r.symbol || r.gecko_id) ? ((r.symbol || '-') + ' / ' + (r.gecko_id || '-')) : 'none recorded'), kv('Snapshot as of', DATA.as_of)
         )
       )
@@ -232,7 +233,7 @@
         el('td', { class: 'num ' + (r.change_7d == null ? '' : r.change_7d >= 0 ? 'pos' : 'neg') }, fmtPct(r.change_7d)),
         el('td', { class: 'num' }, fmtAge(r.age_days)),
         el('td', { class: 'barcell' }, el('div', { class: 'num' }, fmtUsd(r.implied_value_usd)), el('div', { class: 'bar' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' }))),
-        el('td', null, el('span', { class: 'badge' }, 'pre-token'))
+        el('td', null, el('span', { class: r.on_watchlist ? 'badge watch' : 'badge early' }, r.on_watchlist ? 'watchlist' : 'early find'))
       );
       tb.appendChild(tr);
     });
@@ -284,7 +285,13 @@
 
     var panel = el('section', { class: 'panel' });
     var q = el('input', { type:'search', value: state.q, placeholder:'Search protocol, slug, chain, category' });
-    q.addEventListener('input', function () { state.q = q.value; syncHash(); render(); });
+    q.addEventListener('input', function () {
+      state.q = q.value;
+      var caret = q.selectionStart == null ? q.value.length : q.selectionStart;
+      syncHash(); render();
+      var next = root.querySelector('input[type="search"]');
+      if (next) { next.focus(); try { next.setSelectionRange(caret, caret); } catch (e) {} }
+    });
     var cat = el('select');
     cat.appendChild(el('option', { value:'all', text:'All categories' }));
     categories().forEach(function (c) { var o = el('option', { value:c, text:c }); if (state.category===c) o.selected=true; cat.appendChild(o); });
