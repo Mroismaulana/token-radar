@@ -3,12 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="Token Radar: pre-token protocols ranked by an explainable, snapshot-derived implied value.">
   <title>Token Radar — Pre-token protocols ranked by implied value</title>
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
   <a class="skip" href="#board">Skip to the board</a>
+  <div id="status" class="sr-only" role="status" aria-live="polite"></div>
   <main id="board" tabindex="-1" aria-busy="true"></main>
+  <noscript><p class="noscript">Token Radar renders its board with JavaScript from the bundled data.js. No network access is needed.</p></noscript>
   <script src="../data.js"></script>
   <script src="app.js"></script>
 </body>

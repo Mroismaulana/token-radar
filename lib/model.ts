@@ -1,6 +1,7 @@
-// Token Radar model (radar-2): scores pre-token protocols from snapshot figures only.
-// The board covers every watchlist slug (floor, never ceiling) and adds early pre-token
-// protocols below the floor so readers can spot launches before they are obvious.
+// Token Radar model (radar-2): scores pre-token protocols from sealed snapshot figures only.
+//
+// The board covers every watchlist slug (the floor, never the ceiling) and adds early
+// pre-token protocols below the floor, so readers can spot launches before they are obvious.
 //
 // Implied value is a deterministic, explainable estimate (not a price prediction):
 //   base         = tvl_usd * BASE_MULTIPLE
@@ -12,7 +13,11 @@
 //   categoryMult = category factor from snapshot category (no name special-casing)
 //   implied      = max(1, round(base * growthMult * maturityMult * chainMult * categoryMult))
 //
-// All factors come from the sealed snapshot. No protocol name is special-cased.
+// Every factor comes from the sealed snapshot. No protocol name is special-cased.
+// The arithmetic here is deliberately pinned: out/board.json and out/data.js are byte-compared
+// against a saved baseline, so this file changes naming and structure, never numbers or order.
+
+// --------------------------------------------------------------------------- input shapes
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -28,7 +33,7 @@ export interface SnapshotProtocol {
   symbol: string | null;
 }
 
-/** The whole snapshot document. */
+/** The whole sealed snapshot document. */
 export interface Snapshot {
   as_of: string;
   source: string;
@@ -36,6 +41,8 @@ export interface Snapshot {
   protocols: SnapshotProtocol[];
   watchlist: string[];
 }
+
+// --------------------------------------------------------------------------- model constants
 
 /** The model's constants, as the dashboard states them and the sandbox may change them. */
 export interface ModelConstants {
@@ -51,6 +58,7 @@ export interface ModelConstants {
   chain_cap: number;
 }
 
+/** The shipped constants (radar-2). */
 export const MODEL: ModelConstants = {
   base_multiple: 0.22,
   growth_weight: 0.55,
@@ -80,6 +88,113 @@ export interface FarmStep {
   time: string;
 }
 
+// --------------------------------------------------------------------------- small helpers
+
+const DAY_MS = 86_400_000;
+
+/** A number rounded to four decimals: the precision board.json records multipliers at. */
+const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+
+/** `value` kept inside [min, max]. */
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+/** A finite number, else `fallback`. */
+function asFiniteNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/** Order two slugs by code unit, so equal scores always break ties the same way. */
+function bySlugOrder(a: { slug: string }, b: { slug: string }): number {
+  return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
+}
+
+// --------------------------------------------------------------------------- ages
+
+/**
+ * Whole days from `listedAt` to `asOf`, clamped at zero.
+ * Null when the protocol has no listing date or either date does not parse.
+ */
+export function ageDays(asOf: string, listedAt: string | null): number | null {
+  if (listedAt === null) return null;
+  const asOfMs = Date.parse(`${asOf}T00:00:00Z`);
+  const listedMs = Date.parse(`${listedAt}T00:00:00Z`);
+  if (!Number.isFinite(asOfMs) || !Number.isFinite(listedMs)) return null;
+  return Math.max(0, Math.floor((asOfMs - listedMs) / DAY_MS));
+}
+
+// --------------------------------------------------------------------------- scoring
+
+/**
+ * Category signal from the snapshot category alone: established sectors get a small lift.
+ * Deliberately substring-based, because DefiLlama's category labels carry suffixes.
+ */
+export function categoryMultiplier(category: string | null): number {
+  const c = (category ?? '').toLowerCase();
+  if (c.includes('lending') || c.includes('cdp')) return 1.08;
+  if (c.includes('dex') || c.includes('derivatives') || c.includes('perp')) return 1.06;
+  if (c.includes('yield') || c.includes('liquid staking') || c.includes('restaking')) return 1.04;
+  if (c.includes('bridge') || c.includes('chain')) return 1.03;
+  if (c.includes('rwa') || c.includes('prediction') || c.includes('options')) return 1.02;
+  return 1.0;
+}
+
+/** Every factor the model derives for one protocol, plus the implied value itself. */
+export interface ImpliedValue {
+  implied: number;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  chainMult: number;
+  categoryMult: number;
+  age: number | null;
+}
+
+/** The multipliers and the implied value one protocol gets under `model`. */
+export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): ImpliedValue {
+  const age = ageDays(asOf, protocol.listed_at);
+
+  const rawGrowth = asFiniteNumber(protocol.change_7d, 0);
+  const growthPct = clamp(rawGrowth, model.growth_floor, model.growth_cap);
+  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+
+  const ageForModel = age ?? model.unknown_age_days;
+  const maturityMult =
+    model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+
+  const chainCount = Math.max(1, protocol.chains.length);
+  const chainMult = 1 + Math.min(chainCount - 1, model.chain_cap) * model.chain_weight;
+
+  const categoryMult = categoryMultiplier(protocol.category);
+  const base = protocol.tvl_usd * model.base_multiple;
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult * categoryMult));
+
+  return { implied, growthPct, growthMult, maturityMult, chainMult, categoryMult, age };
+}
+
+// --------------------------------------------------------------------------- classification
+
+/** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
+const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
+
+/** Whether a protocol records no token at all. */
+export function isPreToken(p: SnapshotProtocol): boolean {
+  return p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
+}
+
+/** Whether a protocol is one the board may rank: pre-token, not an exchange, not a versioned pool. */
+export function isRankable(p: SnapshotProtocol): boolean {
+  return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
+}
+
+/** The snapshot's protocol by slug. */
+function indexBySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
+  return new Map(protocols.map((p) => [p.slug, p]));
+}
+
+// --------------------------------------------------------------------------- board building
+
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
   rank: number;
@@ -108,163 +223,51 @@ export interface BoardRow {
   farm_steps: string[];
 }
 
-/** The dashboard's compact view of one row, with farm plans generated in the page. */
-export interface RadarRow {
-  rank: number;
-  slug: string;
-  name: string;
-  category: string | null;
-  chains: string[];
-  tvl_usd: number;
-  change_7d: number | null;
-  mcap_usd: number | null;
-  listed_at: string | null;
-  age_days: number | null;
-  implied_value_usd: number;
-  growth_multiplier: number;
-  maturity_multiplier: number;
-  chain_multiplier: number;
-  category_multiplier: number;
-  on_watchlist: boolean;
+/** A protocol with its score, before it takes a rank. */
+interface ScoredProtocol extends ImpliedValue {
+  protocol: SnapshotProtocol;
 }
 
-/** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
-export interface LiveRow {
-  slug: string;
-  name: string;
-  category: string | null;
-  chains: string[];
-  tvl_usd: number;
-  mcap_usd: number | null;
-  change_7d: number | null;
-}
-
-/** Everything the dashboard needs: the board, the live set, and the model it runs. */
-export interface RadarData {
-  as_of: string;
-  source: string;
-  floor_usd: number;
-  model: ModelConstants;
-  model_version: string;
-  watchlist_size: number;
-  watchlist: string[];
-  board_size: number;
-  early_size: number;
-  live_size: number;
-  rows: RadarRow[];
-  live: LiveRow[];
-}
-
-/** Why the snapshot is not one this model can score. */
-export class SnapshotError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'SnapshotError';
-  }
-}
-
-const DAY_MS = 86_400_000;
-
-/** A finite number, else `fallback`. */
-function finite(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
-}
-
-/** A whole day count from `from` to `to`, clamped at zero; null when either date is absent or bad. */
-export function ageDays(asOf: string, listedAt: string | null): number | null {
-  if (listedAt === null) return null;
-  const a = Date.parse(`${asOf}T00:00:00Z`);
-  const b = Date.parse(`${listedAt}T00:00:00Z`);
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-  return Math.max(0, Math.floor((a - b) / DAY_MS));
-}
-
-/** Category signal from snapshot category only: larger established sectors get a small lift. */
-export function categoryMultiplier(category: string | null): number {
-  const c = (category ?? '').toLowerCase();
-  if (c.includes('lending') || c.includes('cdp')) return 1.08;
-  if (c.includes('dex') || c.includes('derivatives') || c.includes('perp')) return 1.06;
-  if (c.includes('yield') || c.includes('liquid staking') || c.includes('restaking')) return 1.04;
-  if (c.includes('bridge') || c.includes('chain')) return 1.03;
-  if (c.includes('rwa') || c.includes('prediction') || c.includes('options')) return 1.02;
-  return 1.0;
-}
-
-/** The multipliers and the implied value one protocol gets under `model`. */
-export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; categoryMult: number; age: number | null } {
-  const age = ageDays(asOf, protocol.listed_at);
-  const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const chainCount = Math.max(1, protocol.chains.length);
-  const chainMult = 1 + Math.min(chainCount - 1, model.chain_cap) * model.chain_weight;
-  const categoryMult = categoryMultiplier(protocol.category);
-  const base = protocol.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult * categoryMult));
-  return { implied, growthPct, growthMult, maturityMult, chainMult, categoryMult, age };
-}
-
-/** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
-const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
-
-/** Whether a protocol records no token at all. */
-export function isPreToken(p: SnapshotProtocol): boolean {
-  return p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
-}
-
-/** Whether a protocol is one the board may rank: pre-token, not an exchange, not a versioned pool. */
-export function isRankable(p: SnapshotProtocol): boolean {
-  return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
-}
-
-/** The snapshot's protocol by slug. */
-function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
-  return new Map(protocols.map((p) => [p.slug, p]));
-}
-
-/** The headline sentence's figures: how many watchlist slugs, how many rows, how many live protocols. */
-export interface BoardSummary {
-  watchlist_size: number;
-  board_size: number;
-  early_size: number;
-  live_size: number;
-}
-
-/** The protocols the board ranks, strongest first, with ranks 1..n. */
+/**
+ * The protocols the board ranks, strongest first, with ranks 1..n.
+ *
+ * The watchlist is the floor: every slug it names is included even if the snapshot no longer
+ * carries it (a missing protocol cannot happen in the sealed input, but the rule is coverage).
+ * Early rows are pre-token protocols below the floor, by TVL, capped at EARLY_ROWS.
+ */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const index = bySlug(snapshot.protocols);
+  const index = indexBySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
-  // The watchlist is the floor: every slug, even one the snapshot no longer carries.
+
   for (const slug of snapshot.watchlist) {
-    const p = index.get(slug);
-    if (p !== undefined) chosen.set(slug, p);
+    const protocol = index.get(slug);
+    if (protocol !== undefined) chosen.set(slug, protocol);
   }
-  // Early radar: pre-token protocols below the watchlist floor, by TVL, capped.
+
   const early = snapshot.protocols
     .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
-    .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
+    .sort((a, b) => b.tvl_usd - a.tvl_usd || bySlugOrder(a, b))
     .slice(0, EARLY_ROWS);
-  for (const p of early) chosen.set(p.slug, p);
+  for (const protocol of early) chosen.set(protocol.slug, protocol);
 
-  const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, model);
-    return { p, ...v };
-  });
-  scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  const scored: ScoredProtocol[] = [...chosen.values()].map((protocol) => ({
+    protocol,
+    ...impliedValue(protocol, snapshot.as_of, model),
+  }));
+  scored.sort((a, b) => b.implied - a.implied || bySlugOrder(a.protocol, b.protocol));
+
   return scored.map((s, i) => ({
     rank: i + 1,
-    slug: s.p.slug,
-    name: s.p.name,
-    category: s.p.category,
-    chains: s.p.chains,
-    tvl_usd: s.p.tvl_usd,
-    change_7d: s.p.change_7d,
-    mcap_usd: s.p.mcap_usd,
-    listed_at: s.p.listed_at,
-    gecko_id: s.p.gecko_id,
-    symbol: s.p.symbol,
+    slug: s.protocol.slug,
+    name: s.protocol.name,
+    category: s.protocol.category,
+    chains: s.protocol.chains,
+    tvl_usd: s.protocol.tvl_usd,
+    change_7d: s.protocol.change_7d,
+    mcap_usd: s.protocol.mcap_usd,
+    listed_at: s.protocol.listed_at,
+    gecko_id: s.protocol.gecko_id,
+    symbol: s.protocol.symbol,
     token_status: 'pre-token',
     age_days: s.age,
     implied_value_usd: s.implied,
@@ -277,11 +280,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       category_multiplier: round4(s.categoryMult),
       age_days: s.age,
     },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm_steps: farmSteps(s.protocol, s.age).map(stepText),
   }));
 }
 
-const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+// --------------------------------------------------------------------------- farm plans
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
 export function stepText(step: FarmStep): string {
@@ -292,7 +295,7 @@ export function stepText(step: FarmStep): string {
 }
 
 /** The primary chain a protocol names, or a neutral phrase. */
-function chainOf(p: SnapshotProtocol): string {
+function primaryChain(p: SnapshotProtocol): string {
   return p.chains.length > 0 ? p.chains[0]! : 'its primary chain';
 }
 
@@ -349,7 +352,7 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
  * (TVL, chains, age, category), never from a hand-written list of protocol names.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
-  const chain = chainOf(p);
+  const chain = primaryChain(p);
   const chains = p.chains.length > 0 ? p.chains.slice(0, 3).join(', ') : chain;
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
@@ -388,6 +391,55 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '10-20 minutes when claiming',
     },
   ];
+}
+
+// --------------------------------------------------------------------------- dashboard payload
+
+/** The dashboard's compact view of one row, with farm plans generated in the page. */
+export interface RadarRow {
+  rank: number;
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number | null;
+  mcap_usd: number | null;
+  listed_at: string | null;
+  age_days: number | null;
+  implied_value_usd: number;
+  growth_multiplier: number;
+  maturity_multiplier: number;
+  chain_multiplier: number;
+  category_multiplier: number;
+  on_watchlist: boolean;
+}
+
+/** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
+export interface LiveRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  mcap_usd: number | null;
+  change_7d: number | null;
+}
+
+/** Everything the dashboard needs: the board, the live set, and the model it runs. */
+export interface RadarData {
+  as_of: string;
+  source: string;
+  floor_usd: number;
+  model: ModelConstants;
+  model_version: string;
+  watchlist_size: number;
+  watchlist: string[];
+  board_size: number;
+  early_size: number;
+  live_size: number;
+  rows: RadarRow[];
+  live: LiveRow[];
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
@@ -451,6 +503,16 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   return { board, radar };
 }
 
+// --------------------------------------------------------------------------- snapshot parsing
+
+/** Why the snapshot is not one this model can score. */
+export class SnapshotError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SnapshotError';
+  }
+}
+
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */
 export function parseSnapshot(text: string): Snapshot {
   let raw: unknown;
@@ -494,6 +556,8 @@ export function parseSnapshot(text: string): Snapshot {
   };
 }
 
+// --------------------------------------------------------------------------- gate invariants
+
 /** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */
 export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null {
   const slugs = new Set(board.map((r) => r.slug));
@@ -514,7 +578,146 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
   return null;
 }
 
+// --------------------------------------------------------------------------- data.js
+
 /** A compact data.js: the dashboard's whole dataset as one script, no fetch and no network. */
 export function dataScript(radar: RadarData): string {
   return `window.RADAR=${JSON.stringify(radar)};\n`;
+}
+
+// --------------------------------------------------------------------------- self-check
+
+/** One named check: what it proves and whether it held. */
+export interface SelfCheckItem {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** The model's self-check: deterministic invariants plus pinned figures for the shipped constants. */
+export interface SelfCheckReport {
+  ok: boolean;
+  checks: SelfCheckItem[];
+}
+
+/** A fixed protocol the self-check scores: lending, two chains, $1B TVL, +20% 7d, 169 days listed. */
+const SELF_CHECK_PROTOCOL: SnapshotProtocol = {
+  slug: 'self-check-fixture',
+  name: 'Self Check Fixture',
+  category: 'Lending',
+  chains: ['Ethereum', 'Arbitrum'],
+  tvl_usd: 1_000_000_000,
+  change_7d: 20,
+  mcap_usd: null,
+  listed_at: '2026-05-29',
+  gecko_id: null,
+  symbol: null,
+};
+
+/**
+ * Exercise the model without a snapshot: constant sanity, date math, category table,
+ * clamping, the pinned fixture score, the farm-step bounds and board ordering.
+ *
+ * `node main.ts --verify` runs this before checking a written board. Returns every check with
+ * its detail, so a caller can print the failures rather than guess.
+ */
+export function selfCheck(model: ModelConstants = MODEL): SelfCheckReport {
+  const checks: SelfCheckItem[] = [];
+  const check = (name: string, ok: boolean, detail: string): void => {
+    checks.push({ name, ok, detail });
+  };
+
+  const constants = Object.entries(model);
+  check(
+    'constants are finite and ordered',
+    constants.every(([, v]) => Number.isFinite(v)) && model.growth_floor < 0 && model.growth_cap > 0 && model.maturity_floor > 0 && model.maturity_floor <= 1 && model.maturity_range >= 0 && model.chain_weight >= 0 && model.chain_cap >= 0,
+    constants.map(([k, v]) => `${k}=${v}`).join(', '),
+  );
+
+  check(
+    'age math',
+    ageDays('2026-11-14', '2026-05-29') === 169 && ageDays('2026-11-14', null) === null && ageDays('2026-11-14', '2027-01-01') === 0,
+    '2026-05-29 -> 2026-11-14 is 169 days; a missing date is null; a future date clamps to 0',
+  );
+
+  check(
+    'category table',
+    categoryMultiplier('Lending') === 1.08 && categoryMultiplier('DEX') === 1.06 && categoryMultiplier('Yield') === 1.04 && categoryMultiplier('Bridge') === 1.03 && categoryMultiplier('RWA') === 1.02 && categoryMultiplier(null) === 1.0,
+    'lending 1.08, dex 1.06, yield 1.04, bridge 1.03, rwa 1.02, unknown 1.0',
+  );
+
+  const base = impliedValue(SELF_CHECK_PROTOCOL, '2026-11-14', model);
+  const consistent = Math.max(1, Math.round(SELF_CHECK_PROTOCOL.tvl_usd * model.base_multiple * base.growthMult * base.maturityMult * base.chainMult * base.categoryMult));
+  check('implied value matches its factors', consistent === base.implied, `recorded $${base.implied}, recomputed $${consistent}`);
+
+  if (model === MODEL) {
+    check(
+      'pinned fixture score',
+      base.implied === 186_143_376 && base.growthPct === 20 && base.growthMult === 1.11 && base.categoryMult === 1.08 && base.chainMult === 1.04 && base.age === 169,
+      `$${base.implied}, growth ${base.growthPct}% x${base.growthMult}, maturity x${base.maturityMult}, chain x${base.chainMult}, category x${base.categoryMult}`,
+    );
+  }
+
+  const hot = impliedValue({ ...SELF_CHECK_PROTOCOL, change_7d: 900 }, '2026-11-14', model);
+  const cold = impliedValue({ ...SELF_CHECK_PROTOCOL, change_7d: -900 }, '2026-11-14', model);
+  check(
+    'growth is clamped',
+    hot.growthPct === model.growth_cap && cold.growthPct === model.growth_floor,
+    `+900% -> ${hot.growthPct}% (cap ${model.growth_cap}), -900% -> ${cold.growthPct}% (floor ${model.growth_floor})`,
+  );
+
+  const flat = impliedValue({ ...SELF_CHECK_PROTOCOL, change_7d: 0, chains: ['Ethereum'] }, '2026-11-14', model);
+  check(
+    'neutral growth and one chain are 1x',
+    flat.growthMult === 1 && flat.chainMult === 1,
+    `growth x${flat.growthMult}, chain x${flat.chainMult}`,
+  );
+
+  const doubled = impliedValue({ ...SELF_CHECK_PROTOCOL, tvl_usd: 2_000_000_000 }, '2026-11-14', model);
+  check(
+    'implied value is linear in TVL',
+    Math.abs(doubled.implied - base.implied * 2) <= 1,
+    `$${base.implied} at $1B, $${doubled.implied} at $2B`,
+  );
+
+  const unknownAge = impliedValue({ ...SELF_CHECK_PROTOCOL, listed_at: null }, '2026-11-14', model);
+  const expectedUnknown = model.maturity_floor + (Math.min(model.unknown_age_days, model.maturity_days) / model.maturity_days) * model.maturity_range;
+  check(
+    'unknown age uses the fallback',
+    Math.abs(unknownAge.maturityMult - expectedUnknown) < 1e-12 && unknownAge.age === null,
+    `maturity x${unknownAge.maturityMult} from ${model.unknown_age_days} default days`,
+  );
+
+  const steps = farmSteps(SELF_CHECK_PROTOCOL, base.age);
+  const stepTexts = steps.map(stepText);
+  check(
+    'farm steps fit the gate',
+    stepTexts.length >= 3 && stepTexts.length <= 12 && stepTexts.every((s) => s.length >= 20 && s.length <= 600),
+    `${stepTexts.length} steps, ${Math.min(...stepTexts.map((s) => s.length))}-${Math.max(...stepTexts.map((s) => s.length))} characters`,
+  );
+
+  const fixtureSnapshot: Snapshot = {
+    as_of: '2026-11-14',
+    source: 'self-check',
+    floor_usd: 50_000_000,
+    watchlist: ['self-check-fixture'],
+    protocols: [
+      SELF_CHECK_PROTOCOL,
+      { ...SELF_CHECK_PROTOCOL, slug: 'self-check-small', name: 'Self Check Small', tvl_usd: 10_000_000, category: 'DEX' },
+      { ...SELF_CHECK_PROTOCOL, slug: 'self-check-tiny', name: 'Self Check Tiny', tvl_usd: 1_000_000, change_7d: -10 },
+    ],
+  };
+  const fixtureBoard = buildBoard(fixtureSnapshot, model);
+  const ranksContiguous = fixtureBoard.every((r, i) => r.rank === i + 1);
+  const nonIncreasing = fixtureBoard.every((r, i) => i === 0 || fixtureBoard[i - 1]!.implied_value_usd >= r.implied_value_usd);
+  check(
+    'board ranks are contiguous and ordered',
+    ranksContiguous && nonIncreasing && fixtureBoard[0]!.slug === 'self-check-fixture',
+    `${fixtureBoard.length} fixture rows, ranks ${fixtureBoard.map((r) => r.rank).join(',')}`,
+  );
+
+  const fixtureIssue = boardIssue(fixtureBoard, fixtureSnapshot);
+  check('fixture board passes the gate', fixtureIssue === null, fixtureIssue ?? 'no issue');
+
+  return { ok: checks.every((c) => c.ok), checks };
 }
